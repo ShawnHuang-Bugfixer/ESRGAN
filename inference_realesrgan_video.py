@@ -1,4 +1,4 @@
-import argparse
+﻿import argparse
 import cv2
 import glob
 import mimetypes
@@ -149,7 +149,7 @@ class Writer:
                                  audio,
                                  video_save_path,
                                  pix_fmt='yuv420p',
-                                 vcodec='libx264',
+                                 vcodec='mpeg4',
                                  loglevel='error',
                                  acodec='copy').overwrite_output().run_async(
                                      pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin))
@@ -157,7 +157,7 @@ class Writer:
             self.stream_writer = (
                 ffmpeg.input('pipe:', format='rawvideo', pix_fmt='bgr24', s=f'{out_width}x{out_height}',
                              framerate=fps).output(
-                                 video_save_path, pix_fmt='yuv420p', vcodec='libx264',
+                                 video_save_path, pix_fmt='yuv420p', vcodec='mpeg4',
                                  loglevel='error').overwrite_output().run_async(
                                      pipe_stdin=True, pipe_stdout=True, cmd=args.ffmpeg_bin))
 
@@ -269,7 +269,8 @@ def inference_video(args, video_save_path, device=None, total_workers=1, worker_
         else:
             writer.write_frame(output)
 
-        torch.cuda.synchronize(device)
+        if device is not None and device.type == 'cuda':
+            torch.cuda.synchronize(device)
         pbar.update(1)
 
     reader.close()
@@ -287,6 +288,10 @@ def run(args):
         args.input = tmp_frames_folder
 
     num_gpus = torch.cuda.device_count()
+    if num_gpus == 0:
+        inference_video(args, video_save_path, device=torch.device('cpu'))
+        return
+
     num_process = num_gpus * args.num_process_per_gpu
     if num_process == 1:
         inference_video(args, video_save_path)
@@ -396,3 +401,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+

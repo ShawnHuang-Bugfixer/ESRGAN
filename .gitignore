@@ -138,3 +138,5 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+/python_sr_service/application.yml
+/python_sr_service/application.example.yml

@@ -2,7 +2,13 @@ import torch
 import yaml
 from basicsr.archs.rrdbnet_arch import RRDBNet
 from basicsr.data.paired_image_dataset import PairedImageDataset
-from basicsr.losses.losses import GANLoss, L1Loss, PerceptualLoss
+try:
+    # basicsr<=1.4.1
+    from basicsr.losses.losses import GANLoss, L1Loss, PerceptualLoss
+except ModuleNotFoundError:
+    # basicsr>=1.4.2
+    from basicsr.losses.basic_loss import L1Loss, PerceptualLoss
+    from basicsr.losses.gan_loss import GANLoss
 
 from realesrgan.archs.discriminator_arch import UNetDiscriminatorSN
 from realesrgan.models.realesrgan_model import RealESRGANModel
@@ -124,3 +130,4 @@ def test_realesrgan_model():
     # check returned keys
     expected_keys = ['l_g_pix', 'l_g_percep', 'l_g_gan', 'l_d_real', 'out_d_real', 'l_d_fake', 'out_d_fake']
     assert set(expected_keys).issubset(set(model.log_dict.keys()))
+
