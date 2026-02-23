@@ -175,6 +175,7 @@
 ### Phase 2：接入 MySQL（建库建表）
 目标：完成数据库初始化和事件审计落库。
 
+
 交付项：
 1. 建库与 DDL：`sr_task`、`sr_task_event`。
 2. Python 持久化层：仅写 `sr_task_event`，不写 `sr_task.status`。
@@ -186,6 +187,10 @@
 
 ### Phase 3：接入 RabbitMQ（消息收发与重试）
 目标：完成消息驱动闭环和重试机制。
+
+账号密码：admin/Admin@123 
+
+rabbitmq 服务地址：localhost
 
 交付项：
 1. 消费 `sr.task.queue`，发布 `sr.result`。
