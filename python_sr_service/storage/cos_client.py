@@ -1,9 +1,13 @@
+import logging
 import os
 from typing import Any, Optional
 
 from python_sr_service.config import COSSettings
 from python_sr_service.domain.errors import ErrorCode, ServiceError
+from python_sr_service.runtime.logging import format_log_fields
 from python_sr_service.storage.object_storage import ObjectStorage
+
+logger = logging.getLogger(__name__)
 
 
 class TencentCOSClient(ObjectStorage):
@@ -19,18 +23,64 @@ class TencentCOSClient(ObjectStorage):
 
     def download(self, object_key: str, local_path: str) -> None:
         full_key = self._full_key(object_key)
+        logger.info(
+            'cos_download_start %s',
+            format_log_fields(
+                {
+                    'phase': 'download',
+                    'bucket': self._bucket,
+                    'objectKey': full_key,
+                    'localPath': local_path,
+                },
+            ),
+        )
         try:
             response = self._client.get_object(Bucket=self._bucket, Key=full_key)
             os.makedirs(os.path.dirname(local_path) or '.', exist_ok=True)
             response['Body'].get_stream_to_file(local_path)
+            logger.info(
+                'cos_download_done %s',
+                format_log_fields(
+                    {
+                        'phase': 'download',
+                        'status': 'DONE',
+                        'bucket': self._bucket,
+                        'objectKey': full_key,
+                        'localPath': local_path,
+                    },
+                ),
+            )
         except Exception as exc:
             raise self._to_service_error('download', full_key, exc) from exc
 
     def upload(self, local_path: str, object_key: str) -> None:
         full_key = self._full_key(object_key)
+        logger.info(
+            'cos_upload_start %s',
+            format_log_fields(
+                {
+                    'phase': 'upload',
+                    'bucket': self._bucket,
+                    'objectKey': full_key,
+                    'localPath': local_path,
+                },
+            ),
+        )
         try:
             with open(local_path, 'rb') as file_obj:
                 self._client.put_object(Bucket=self._bucket, Body=file_obj, Key=full_key)
+            logger.info(
+                'cos_upload_done %s',
+                format_log_fields(
+                    {
+                        'phase': 'upload',
+                        'status': 'DONE',
+                        'bucket': self._bucket,
+                        'objectKey': full_key,
+                        'localPath': local_path,
+                    },
+                ),
+            )
         except Exception as exc:
             raise self._to_service_error('upload', full_key, exc) from exc
 
@@ -106,6 +156,20 @@ class TencentCOSClient(ObjectStorage):
         else:
             code = ErrorCode.COS_DOWNLOAD_FAILED
             message = f'Failed to download file from COS: {object_key}'
+        logger.error(
+            'cos_operation_failed %s',
+            format_log_fields(
+                {
+                    'phase': operation,
+                    'status': 'FAILED',
+                    'bucket': self._bucket,
+                    'objectKey': object_key,
+                    'errorCode': code.value,
+                    'errorMsg': message,
+                    'retryable': retryable,
+                },
+            ),
+        )
         return ServiceError(code=code, message=message, retryable=retryable, cause=exc)
 
 

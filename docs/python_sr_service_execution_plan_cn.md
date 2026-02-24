@@ -192,11 +192,17 @@
 
 rabbitmq 服务地址：localhost
 
+redis 信息：
+服务地址：localhost
+密码：qwDFerAs1
+
 交付项：
 1. 消费 `sr.task.queue`，发布 `sr.result`。
 2. 消费确认机制：手动 ack，`prefetch_count=1`。
 3. 延迟重试队列：10s/30s/60s + DLQ。
 4. Redis 幂等：按 `eventId` 去重。
+
+
 
 验收：
 1. 可发送任务消息并收到结果消息。

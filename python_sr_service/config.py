@@ -1,10 +1,11 @@
 from dataclasses import dataclass
 import os
+from pathlib import Path
 from typing import Any, Dict
 
 import yaml
 
-DEFAULT_CONFIG_PATH = 'python_sr_service/application.yml'
+DEFAULT_CONFIG_PATH = str(Path(__file__).resolve().parent / 'application.yml')
 
 
 @dataclass(frozen=True)
@@ -29,9 +30,55 @@ class MySQLSettings:
 
 
 @dataclass(frozen=True)
+class RabbitMQSettings:
+    url: str
+    task_queue: str = 'sr.task.queue'
+    task_exchange: str = 'x.sr.task.direct'
+    task_routing_key: str = 'sr.task'
+    result_exchange: str = 'x.sr.result.direct'
+    result_routing_key: str = 'sr.result'
+    retry_exchange: str = 'x.sr.retry.direct'
+    prefetch: int = 1
+
+
+@dataclass(frozen=True)
+class RedisSettings:
+    url: str
+
+
+@dataclass(frozen=True)
+class IdempotencySettings:
+    ttl_seconds: int = 259200
+
+
+@dataclass(frozen=True)
+class InferenceSettings:
+    model_name: str = 'RealESRGAN_x4plus'
+    model_weights: str = ''
+    denoise_strength: float = 1.0
+    device: str = 'cuda:0'
+    tile: int = 0
+    tile_pad: int = 10
+    pre_pad: int = 0
+    fp32: bool = False
+
+
+@dataclass(frozen=True)
+class RuntimeSettings:
+    work_dir: str = './runtime'
+    worker_id: str = ''
+    log_level: str = 'INFO'
+
+
+@dataclass(frozen=True)
 class Settings:
     cos: COSSettings
     mysql: MySQLSettings
+    rabbitmq: RabbitMQSettings
+    redis: RedisSettings
+    idempotency: IdempotencySettings
+    inference: InferenceSettings
+    runtime: RuntimeSettings
 
     @classmethod
     def from_env(cls, config_path: str = ''):
@@ -39,6 +86,11 @@ class Settings:
         config_data = _load_config_file(resolved_path)
         cos_config = config_data.get('cos', {})
         mysql_config = config_data.get('mysql', {})
+        rabbitmq_config = config_data.get('rabbitmq', {})
+        redis_config = config_data.get('redis', {})
+        idempotency_config = config_data.get('idempotency', {})
+        inference_config = config_data.get('inference', {})
+        runtime_config = config_data.get('runtime', {})
 
         return cls(
             cos=COSSettings(
@@ -78,6 +130,67 @@ class Settings:
                     default=True,
                 ),
             ),
+            rabbitmq=RabbitMQSettings(
+                url=_get_value('MQ_URL', rabbitmq_config, 'url', required=True),
+                task_queue=_get_value('MQ_TASK_QUEUE', rabbitmq_config, 'task_queue', default='sr.task.queue'),
+                task_exchange=_get_value('MQ_TASK_EXCHANGE', rabbitmq_config, 'task_exchange', default='x.sr.task.direct'),
+                task_routing_key=_get_value('MQ_TASK_ROUTING_KEY', rabbitmq_config, 'task_routing_key', default='sr.task'),
+                result_exchange=_get_value(
+                    'MQ_RESULT_EXCHANGE',
+                    rabbitmq_config,
+                    'result_exchange',
+                    default='x.sr.result.direct',
+                ),
+                result_routing_key=_get_value(
+                    'MQ_RESULT_ROUTING_KEY',
+                    rabbitmq_config,
+                    'result_routing_key',
+                    default='sr.result',
+                ),
+                retry_exchange=_get_value(
+                    'MQ_RETRY_EXCHANGE',
+                    rabbitmq_config,
+                    'retry_exchange',
+                    default='x.sr.retry.direct',
+                ),
+                prefetch=_get_int_value('MQ_PREFETCH', rabbitmq_config, 'prefetch', default=1),
+            ),
+            redis=RedisSettings(
+                url=_get_value('REDIS_URL', redis_config, 'url', required=True),
+            ),
+            idempotency=IdempotencySettings(
+                ttl_seconds=_get_int_value(
+                    'IDEMP_TTL_SECONDS',
+                    idempotency_config,
+                    'ttl_seconds',
+                    default=259200,
+                ),
+            ),
+            inference=InferenceSettings(
+                model_name=_get_value('MODEL_NAME', inference_config, 'model_name', default='RealESRGAN_x4plus'),
+                model_weights=_get_value(
+                    'MODEL_WEIGHTS',
+                    inference_config,
+                    'model_weights',
+                    default='',
+                ),
+                denoise_strength=_get_float_value(
+                    'MODEL_DENOISE_STRENGTH',
+                    inference_config,
+                    'denoise_strength',
+                    default=1.0,
+                ),
+                device=_get_value('DEVICE', inference_config, 'device', default='cuda:0'),
+                tile=_get_int_value('MODEL_TILE', inference_config, 'tile', default=0),
+                tile_pad=_get_int_value('MODEL_TILE_PAD', inference_config, 'tile_pad', default=10),
+                pre_pad=_get_int_value('MODEL_PRE_PAD', inference_config, 'pre_pad', default=0),
+                fp32=_get_bool_value('MODEL_FP32', inference_config, 'fp32', default=False),
+            ),
+            runtime=RuntimeSettings(
+                work_dir=_get_value('WORK_DIR', runtime_config, 'work_dir', default='./runtime'),
+                worker_id=_get_value('WORKER_ID', runtime_config, 'worker_id', default=''),
+                log_level=_get_value('LOG_LEVEL', runtime_config, 'log_level', default='INFO'),
+            ),
         )
 
 
@@ -96,7 +209,7 @@ def _get_value(env_name: str, section: Dict[str, Any], key: str, required: bool 
             return text_value
 
     if required:
-        raise ValueError(f'Missing required configuration: {env_name} (or cos.{key} in config file)')
+        raise ValueError(f'Missing required configuration: {env_name} (or {key} in config file)')
 
     return default
 
@@ -107,6 +220,14 @@ def _get_int_value(env_name: str, section: Dict[str, Any], key: str, default: in
         return int(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f'Invalid integer configuration: {env_name}={value}') from exc
+
+
+def _get_float_value(env_name: str, section: Dict[str, Any], key: str, default: float) -> float:
+    value = _get_value(env_name, section, key, default=str(default))
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f'Invalid float configuration: {env_name}={value}') from exc
 
 
 def _get_bool_value(env_name: str, section: Dict[str, Any], key: str, default: bool) -> bool:
@@ -144,3 +265,5 @@ def _load_config_file(path: str) -> Dict[str, Any]:
         raise ValueError(f'Invalid config file format: {path}')
 
     return data
+
+

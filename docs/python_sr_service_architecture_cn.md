@@ -64,7 +64,7 @@ python_sr_service/
   - `DEVICE=cuda:0`
   - `MAX_VIDEO_FRAMES`（防止超大任务）
 - 运行时
-  - `WORK_DIR=./runtime`
+  - `WORK_DIR=./runtime
   - `TASK_TIMEOUT_SECONDS`
   - `LOG_LEVEL=INFO`
 
