@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+﻿from dataclasses import dataclass
 import os
 from pathlib import Path
 from typing import Any, Dict
@@ -61,6 +61,15 @@ class InferenceSettings:
     tile_pad: int = 10
     pre_pad: int = 0
     fp32: bool = False
+    video_enabled: bool = True
+    ffmpeg_bin: str = 'ffmpeg'
+    ffprobe_bin: str = 'ffprobe'
+    max_video_frames: int = 3000
+    max_video_seconds: int = 180
+    video_frame_ext: str = 'png'
+    video_codec: str = 'libx264'
+    video_pix_fmt: str = 'yuv420p'
+    audio_fallback_no_audio: bool = True
 
 
 @dataclass(frozen=True)
@@ -185,6 +194,20 @@ class Settings:
                 tile_pad=_get_int_value('MODEL_TILE_PAD', inference_config, 'tile_pad', default=10),
                 pre_pad=_get_int_value('MODEL_PRE_PAD', inference_config, 'pre_pad', default=0),
                 fp32=_get_bool_value('MODEL_FP32', inference_config, 'fp32', default=False),
+                video_enabled=_get_bool_value('VIDEO_ENABLED', inference_config, 'video_enabled', default=True),
+                ffmpeg_bin=_get_value('FFMPEG_BIN', inference_config, 'ffmpeg_bin', default='ffmpeg'),
+                ffprobe_bin=_get_value('FFPROBE_BIN', inference_config, 'ffprobe_bin', default='ffprobe'),
+                max_video_frames=_get_int_value('MAX_VIDEO_FRAMES', inference_config, 'max_video_frames', default=3000),
+                max_video_seconds=_get_int_value('MAX_VIDEO_SECONDS', inference_config, 'max_video_seconds', default=180),
+                video_frame_ext=_get_value('VIDEO_FRAME_EXT', inference_config, 'video_frame_ext', default='png'),
+                video_codec=_get_value('VIDEO_CODEC', inference_config, 'video_codec', default='libx264'),
+                video_pix_fmt=_get_value('VIDEO_PIX_FMT', inference_config, 'video_pix_fmt', default='yuv420p'),
+                audio_fallback_no_audio=_get_bool_value(
+                    'AUDIO_FALLBACK_NO_AUDIO',
+                    inference_config,
+                    'audio_fallback_no_audio',
+                    default=True,
+                ),
             ),
             runtime=RuntimeSettings(
                 work_dir=_get_value('WORK_DIR', runtime_config, 'work_dir', default='./runtime'),
@@ -265,5 +288,3 @@ def _load_config_file(path: str) -> Dict[str, Any]:
         raise ValueError(f'Invalid config file format: {path}')
 
     return data
-
-

@@ -3,7 +3,6 @@
 ## 要求
 使用中文，首先阅读 docs 目录下超分文档
 
-
 ## 环境
 使用 conda 配置 python 环境,已有配置好的环境 realesrgan-py310
 

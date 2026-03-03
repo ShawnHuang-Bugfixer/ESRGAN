@@ -33,3 +33,42 @@ def test_task_message_rejects_invalid_timestamp():
 
     assert exc_info.value.code == ErrorCode.SCHEMA_INVALID
     assert str(exc_info.value) == 'Invalid timestamp format, expected ISO-8601'
+
+
+def test_task_message_video_options_default_values():
+    payload = _payload('2026-02-24T06:01:05.759187600Z')
+    payload['type'] = 'video'
+
+    task = TaskMessage.from_dict(payload)
+
+    assert task.task_type == 'video'
+    assert task.video_options.keep_audio is True
+    assert task.video_options.extract_frame_first is True
+    assert task.video_options.fps_override is None
+
+
+def test_task_message_video_options_with_values():
+    payload = _payload('2026-02-24T06:01:05.759187600Z')
+    payload['type'] = 'video'
+    payload['videoOptions'] = {
+        'keepAudio': False,
+        'extractFrameFirst': True,
+        'fpsOverride': 25,
+    }
+
+    task = TaskMessage.from_dict(payload)
+
+    assert task.video_options.keep_audio is False
+    assert task.video_options.extract_frame_first is True
+    assert task.video_options.fps_override == 25.0
+
+
+def test_task_message_video_options_rejects_invalid_value():
+    payload = _payload('2026-02-24T06:01:05.759187600Z')
+    payload['videoOptions'] = {'keepAudio': 'yes'}
+
+    with pytest.raises(ServiceError) as exc_info:
+        TaskMessage.from_dict(payload)
+
+    assert exc_info.value.code == ErrorCode.SCHEMA_INVALID
+    assert 'keepAudio' in str(exc_info.value)

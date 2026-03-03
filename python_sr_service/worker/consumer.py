@@ -15,6 +15,7 @@ from python_sr_service.domain.schema import TaskMessage
 from python_sr_service.idempotency.redis_store import RedisIdempotencyStore
 from python_sr_service.persistence.mysql_event_repo import MySQLEventRepository, TaskEventRecord
 from python_sr_service.pipeline.image_pipeline import ImagePipeline
+from python_sr_service.pipeline.video_pipeline import VideoPipeline
 from python_sr_service.runtime.logging import format_log_fields
 from python_sr_service.runtime.workspace import WorkspaceManager
 from python_sr_service.storage.cos_client import TencentCOSClient
@@ -35,6 +36,7 @@ class RabbitMQConsumer:
         storage: Optional[TencentCOSClient] = None,
         event_repo: Optional[MySQLEventRepository] = None,
         image_pipeline: Optional[ImagePipeline] = None,
+        video_pipeline: Optional[VideoPipeline] = None,
         workspace_manager: Optional[WorkspaceManager] = None,
     ):
         self._settings = settings
@@ -44,6 +46,7 @@ class RabbitMQConsumer:
         self._storage = storage or TencentCOSClient(settings.cos)
         self._event_repo = event_repo or MySQLEventRepository(settings.mysql)
         self._image_pipeline = image_pipeline or ImagePipeline(settings.inference)
+        self._video_pipeline = video_pipeline or VideoPipeline(settings.inference, self._image_pipeline)
         self._workspace_manager = workspace_manager or WorkspaceManager(settings.runtime.work_dir)
         self._worker_id = settings.runtime.worker_id or f'worker-{os.getpid()}'
         self._connection: Optional[pika.BlockingConnection] = None
@@ -193,28 +196,35 @@ class RabbitMQConsumer:
             task = TaskMessage.from_dict(payload)
             logger.info('task_schema_validated %s', self._task_log(task, phase='schema_validate'))
 
-            if task.task_type != 'image':
+            if task.task_type not in ('image', 'video'):
                 raise ServiceError(
                     code=ErrorCode.TYPE_NOT_SUPPORTED,
                     message=f'Unsupported task type: {task.task_type}',
                     retryable=False,
                 )
 
+            if task.task_type == 'video' and not self._settings.inference.video_enabled:
+                raise ServiceError(
+                    code=ErrorCode.TYPE_NOT_SUPPORTED,
+                    message='Video inference is disabled by service configuration',
+                    retryable=False,
+                )
+
             if self._idempotency_store.is_processed(task.event_id):
                 logger.info('task_duplicate_skipped %s', self._task_log(task, phase='idempotency'))
-                # 重复投递直接 ack，避免重复推理。
                 channel.basic_ack(delivery_tag=method.delivery_tag)
                 return
 
             self._save_event(task, 'RECEIVED', payload_json=payload)
-            self._publisher.publish_result(_build_result_payload(task, status='RUNNING', progress=5))
-            logger.info('task_running_published %s', self._task_log(task, phase='running', status='RUNNING', progress=5))
+            self._publish_progress(task, progress=5)
 
-            # 每个任务独立工作目录，便于隔离与清理。
             workspace = self._workspace_manager.create(task.task_id, task.attempt)
             ext = os.path.splitext(task.input_file_key)[1] or '.png'
             local_input = os.path.join(workspace.input_path, f'input{ext}')
-            local_output = os.path.join(workspace.output_path, f'output{ext}')
+            local_output = os.path.join(
+                workspace.output_path,
+                'output.mp4' if task.task_type == 'video' else f'output{ext}',
+            )
             logger.info(
                 'task_workspace_ready %s',
                 self._task_log(
@@ -226,7 +236,6 @@ class RabbitMQConsumer:
                 ),
             )
 
-            # 核心主链路：下载 -> 推理 -> 上传。
             download_started = time.time()
             logger.info('task_phase_start %s', self._task_log(task, phase='download'))
             self._storage.download(task.input_file_key, local_input)
@@ -237,17 +246,75 @@ class RabbitMQConsumer:
                 self._task_log(task, phase='download', status='DONE', costMs=download_cost_ms),
             )
 
+            model_name = task.model_name.strip() or self._settings.inference.model_name
             infer_started = time.time()
-            logger.info('task_phase_start %s', self._task_log(task, phase='enhance'))
-            infer_result = self._image_pipeline.run(local_input, local_output, task.scale)
+            logger.info('task_phase_start %s', self._task_log(task, phase='enhance', taskType=task.task_type))
+
+            if task.task_type == 'image':
+                infer_result = self._image_pipeline.run(
+                    local_input,
+                    local_output,
+                    task.scale,
+                    model_name_override=model_name,
+                )
+                self._save_event(task, 'INFERRED', payload_json={'outputLocalPath': infer_result.output_path})
+            else:
+                progress_state = {'last_progress': 30}
+
+                def _video_phase_callback(phase: str, phase_payload: Dict[str, Any]) -> None:
+                    if phase == 'video_probed':
+                        self._save_event(task, 'VIDEO_PROBED', payload_json=phase_payload)
+                        self._publish_progress(task, progress=20)
+                        return
+                    if phase == 'frames_extracted':
+                        self._save_event(task, 'FRAMES_EXTRACTED', payload_json=phase_payload)
+                        self._publish_progress(task, progress=30)
+                        return
+                    if phase == 'frame_enhanced':
+                        frame_index = int(phase_payload.get('frameIndex', 0) or 0)
+                        total_frames = max(int(phase_payload.get('totalFrames', 1) or 1), 1)
+                        progress = 30 + int(frame_index * 50 / total_frames)
+                        if progress >= progress_state['last_progress'] + 5 or frame_index == total_frames:
+                            progress_state['last_progress'] = progress
+                            self._publish_progress(task, progress=progress)
+                        return
+                    if phase == 'frames_inferred':
+                        self._save_event(task, 'FRAMES_INFERRED', payload_json=phase_payload)
+                        return
+                    if phase == 'audio_fallback':
+                        self._save_event(task, 'AUDIO_FALLBACK', payload_json=phase_payload)
+                        return
+                    if phase == 'video_merged':
+                        self._save_event(task, 'VIDEO_MERGED', payload_json=phase_payload)
+                        self._publish_progress(task, progress=90)
+
+                infer_result = self._video_pipeline.run(
+                    local_input,
+                    local_output,
+                    task.scale,
+                    model_name_override=model_name,
+                    video_options=task.video_options,
+                    phase_callback=_video_phase_callback,
+                )
+                self._save_event(
+                    task,
+                    'INFERRED',
+                    payload_json={
+                        'outputLocalPath': infer_result.output_path,
+                        'frameCount': infer_result.frame_count,
+                        'fps': infer_result.fps,
+                        'usedAudio': infer_result.used_audio,
+                    },
+                )
+
             infer_cost_ms = int((time.time() - infer_started) * 1000)
-            self._save_event(task, 'INFERRED', payload_json={'outputLocalPath': infer_result.output_path})
             logger.info(
                 'task_phase_done %s',
                 self._task_log(
                     task,
                     phase='enhance',
                     status='DONE',
+                    taskType=task.task_type,
                     costMs=max(infer_cost_ms, infer_result.cost_ms),
                     outputLocalPath=infer_result.output_path,
                 ),
@@ -259,6 +326,7 @@ class RabbitMQConsumer:
             self._storage.upload(infer_result.output_path, output_key)
             upload_cost_ms = int((time.time() - upload_started) * 1000)
             self._save_event(task, 'UPLOADED', payload_json={'outputFileKey': output_key})
+            self._publish_progress(task, progress=95)
             logger.info(
                 'task_phase_done %s',
                 self._task_log(task, phase='upload', status='DONE', costMs=upload_cost_ms, outputFileKey=output_key),
@@ -275,7 +343,6 @@ class RabbitMQConsumer:
                 ),
             )
             self._save_event(task, 'SUCCEEDED', payload_json={'outputFileKey': output_key, 'costMs': total_cost_ms})
-            # 仅在终态后标记幂等，避免重试消息被提前去重。
             self._idempotency_store.mark_processed(task.event_id)
             channel.basic_ack(delivery_tag=method.delivery_tag)
             logger.info(
@@ -284,6 +351,7 @@ class RabbitMQConsumer:
                     task,
                     phase='done',
                     status='SUCCEEDED',
+                    taskType=task.task_type,
                     costMs=total_cost_ms,
                     outputFileKey=output_key,
                 ),
@@ -313,11 +381,15 @@ class RabbitMQConsumer:
                         self._task_log(task, phase='cleanup', workspace=workspace.task_root),
                     )
 
+    def _publish_progress(self, task: TaskMessage, progress: int) -> None:
+        bounded = max(0, min(100, int(progress)))
+        self._publisher.publish_result(_build_result_payload(task, status='RUNNING', progress=bounded))
+        logger.info('task_running_published %s', self._task_log(task, phase='running', status='RUNNING', progress=bounded))
+
     def _handle_service_error(self, channel, method, properties, body, task: Optional[TaskMessage], error: ServiceError) -> None:
         retry_attempt = _get_retry_attempt(properties)
         can_retry = error.retryable and retry_attempt < len(self.RETRY_DELAYS_SECONDS)
         if can_retry:
-            # 保留原始消息体，并在 header 中递增重试次数。
             delay = self.RETRY_DELAYS_SECONDS[retry_attempt]
             try:
                 self._ensure_channel()
@@ -375,7 +447,6 @@ class RabbitMQConsumer:
                 ),
             )
             self._save_event(task, 'FAILED', error_code=error.code.value, error_msg=str(error))
-            # 失败终态同样标记幂等，避免消息无限回投。
             self._idempotency_store.mark_processed(task.event_id)
             logger.error(
                 'task_failed %s',
@@ -415,7 +486,6 @@ class RabbitMQConsumer:
         error_msg: str = '',
     ) -> None:
         try:
-            # 事件落库采用尽力而为策略，避免数据库抖动阻塞主流程。
             self._event_repo.save_event(TaskEventRecord(
                 task_id=task.task_id,
                 task_no=task.task_no,
@@ -430,7 +500,6 @@ class RabbitMQConsumer:
             ))
             logger.info('task_event_saved %s', self._task_log(task, phase='event', eventType=event_type))
         except ServiceError as exc:
-            # 即使事件写库失败，也保持主流程继续执行。
             logger.warning(
                 'task_event_save_failed %s',
                 self._task_log(
@@ -457,6 +526,9 @@ class RabbitMQConsumer:
 
 
 def _build_output_key(task: TaskMessage, extension: str) -> str:
+    if task.task_type == 'video':
+        return f'output/{task.task_id}/{task.task_no}_x{task.scale}.mp4'
+
     clean_ext = extension if extension.startswith('.') else f'.{extension}'
     return f'output/{task.task_id}/{task.task_no}_x{task.scale}{clean_ext}'
 
@@ -521,6 +593,3 @@ def _parse_fallback_payload(body: bytes) -> Dict[str, Any]:
         'errorMsg': 'Invalid task message payload',
         'traceId': trace_id,
     }
-
-
-

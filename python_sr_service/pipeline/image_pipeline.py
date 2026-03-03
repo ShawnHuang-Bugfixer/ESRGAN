@@ -2,7 +2,7 @@
 import os
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import cv2
 import torch
@@ -27,12 +27,9 @@ class InferenceOutput:
 class ImagePipeline:
     def __init__(self, settings: InferenceSettings):
         self._settings = settings
-        self._upsampler = None
+        self._upsamplers: Dict[str, RealESRGANer] = {}
 
-    def run(self, input_file: str, output_file: str, scale: int) -> InferenceOutput:
-        # Lazy init avoids loading model weights before the first real task.
-        self._ensure_upsampler()
-
+    def run(self, input_file: str, output_file: str, scale: int, model_name_override: str = '') -> InferenceOutput:
         logger.info(
             'image_infer_start %s',
             format_log_fields(
@@ -41,7 +38,7 @@ class ImagePipeline:
                     'inputFile': input_file,
                     'outputFile': output_file,
                     'scale': scale,
-                    'modelName': self._settings.model_name,
+                    'modelName': self._resolve_model_name(model_name_override),
                     'device': self._settings.device,
                 },
             ),
@@ -55,32 +52,7 @@ class ImagePipeline:
                 retryable=False,
             )
 
-        start = time.time()
-        try:
-            output, _ = self._upsampler.enhance(image, outscale=scale)
-        except RuntimeError as exc:
-            # Separate OOM from generic runtime errors for better handling upstream.
-            text = str(exc).lower()
-            if 'out of memory' in text:
-                raise ServiceError(
-                    code=ErrorCode.GPU_OOM,
-                    message='GPU out of memory during inference',
-                    retryable=False,
-                    cause=exc,
-                ) from exc
-            raise ServiceError(
-                code=ErrorCode.INFER_RUNTIME_ERROR,
-                message='Runtime error during image inference',
-                retryable=True,
-                cause=exc,
-            ) from exc
-        except Exception as exc:
-            raise ServiceError(
-                code=ErrorCode.INFER_RUNTIME_ERROR,
-                message='Failed to run image inference',
-                retryable=True,
-                cause=exc,
-            ) from exc
+        output, cost_ms = self.enhance_array(image, scale, model_name_override=model_name_override)
 
         os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
         if not cv2.imwrite(output_file, output):
@@ -90,7 +62,6 @@ class ImagePipeline:
                 retryable=False,
             )
 
-        cost_ms = int((time.time() - start) * 1000)
         logger.info(
             'image_infer_done %s',
             format_log_fields(
@@ -108,12 +79,45 @@ class ImagePipeline:
             cost_ms=cost_ms,
         )
 
-    def _ensure_upsampler(self) -> None:
-        if self._upsampler is not None:
-            return
+    def enhance_array(self, image, scale: int, model_name_override: str = ''):
+        start = time.time()
+        upsampler = self._ensure_upsampler(model_name_override=model_name_override)
+        try:
+            output, _ = upsampler.enhance(image, outscale=scale)
+        except RuntimeError as exc:
+            text = str(exc).lower()
+            if 'out of memory' in text:
+                raise ServiceError(
+                    code=ErrorCode.GPU_OOM,
+                    message='GPU out of memory during inference',
+                    retryable=False,
+                    cause=exc,
+                ) from exc
+            raise ServiceError(
+                code=ErrorCode.INFER_RUNTIME_ERROR,
+                message='Runtime error during image inference',
+                retryable=True,
+                cause=exc,
+            ) from exc
+        except Exception as exc:
+            logger.exception('image_infer_unexpected_error')
+            raise ServiceError(
+                code=ErrorCode.INFER_RUNTIME_ERROR,
+                message='Failed to run image inference',
+                retryable=True,
+                cause=exc,
+            ) from exc
 
-        model, net_scale = _build_model(self._settings.model_name)
-        model_path, dni_weight = _resolve_model_paths(self._settings)
+        cost_ms = int((time.time() - start) * 1000)
+        return output, cost_ms
+
+    def _ensure_upsampler(self, model_name_override: str = '') -> RealESRGANer:
+        model_name = self._resolve_model_name(model_name_override)
+        if model_name in self._upsamplers:
+            return self._upsamplers[model_name]
+
+        model, net_scale = _build_model(model_name)
+        model_path, dni_weight = _resolve_model_paths(self._settings, model_name_override=model_name)
         model_path = _materialize_model_paths(model_path)
         _validate_model_paths(model_path)
 
@@ -122,7 +126,7 @@ class ImagePipeline:
             'image_model_init %s',
             format_log_fields(
                 {
-                    'modelName': self._settings.model_name,
+                    'modelName': model_name,
                     'modelPath': model_path,
                     'netScale': net_scale,
                     'device': self._settings.device,
@@ -133,8 +137,7 @@ class ImagePipeline:
                 },
             ),
         )
-        # Reuse upsampler in-process to avoid repeated model loading overhead.
-        self._upsampler = RealESRGANer(
+        upsampler = RealESRGANer(
             scale=net_scale,
             model_path=model_path,
             dni_weight=dni_weight,
@@ -145,6 +148,14 @@ class ImagePipeline:
             half=use_half,
             gpu_id=gpu_id,
         )
+        self._upsamplers[model_name] = upsampler
+        return upsampler
+
+    def _resolve_model_name(self, model_name_override: str) -> str:
+        preferred = (model_name_override or '').strip()
+        if preferred:
+            return preferred
+        return self._settings.model_name.strip()
 
 
 def _build_model(model_name: str) -> Tuple[object, int]:
@@ -189,9 +200,15 @@ def _build_model(model_name: str) -> Tuple[object, int]:
     )
 
 
-def _resolve_model_paths(settings: InferenceSettings) -> Tuple[Union[str, List[str]], Optional[List[float]]]:
-    model_name = settings.model_name.strip()
-    primary_path = settings.model_weights.strip() or os.path.join('weights', f'{model_name}.pth')
+def _resolve_model_paths(
+    settings: InferenceSettings,
+    model_name_override: str = '',
+) -> Tuple[Union[str, List[str]], Optional[List[float]]]:
+    model_name = (model_name_override or settings.model_name).strip()
+    if settings.model_weights.strip() and model_name == settings.model_name.strip():
+        primary_path = settings.model_weights.strip()
+    else:
+        primary_path = os.path.join('weights', f'{model_name}.pth')
 
     if model_name != 'realesr-general-x4v3':
         return primary_path, None
