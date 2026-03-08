@@ -1,4 +1,4 @@
-﻿from dataclasses import dataclass
+from dataclasses import dataclass
 import os
 from pathlib import Path
 from typing import Any, Dict
@@ -18,6 +18,10 @@ class COSSettings:
     token: str = ''
     prefix: str = ''
     endpoint: str = ''
+    timeout_seconds: int = 120
+    multipart_threshold_mb: int = 8
+    upload_part_mb: int = 8
+    upload_max_thread: int = 3
 
 
 @dataclass(frozen=True)
@@ -68,6 +72,7 @@ class InferenceSettings:
     max_video_seconds: int = 180
     video_frame_ext: str = 'png'
     video_codec: str = 'libx264'
+    video_codec_fallbacks: tuple[str, ...] = ('h264_mf', 'mpeg4')
     video_pix_fmt: str = 'yuv420p'
     audio_fallback_no_audio: bool = True
 
@@ -111,6 +116,20 @@ class Settings:
                 token=_get_value('COS_TOKEN', cos_config, 'token', default=''),
                 prefix=_get_value('COS_PREFIX', cos_config, 'prefix', default=''),
                 endpoint=_get_value('COS_ENDPOINT', cos_config, 'endpoint', default=''),
+                timeout_seconds=_get_int_value('COS_TIMEOUT_SECONDS', cos_config, 'timeout_seconds', default=120),
+                multipart_threshold_mb=_get_int_value(
+                    'COS_MULTIPART_THRESHOLD_MB',
+                    cos_config,
+                    'multipart_threshold_mb',
+                    default=8,
+                ),
+                upload_part_mb=_get_int_value('COS_UPLOAD_PART_MB', cos_config, 'upload_part_mb', default=8),
+                upload_max_thread=_get_int_value(
+                    'COS_UPLOAD_MAX_THREAD',
+                    cos_config,
+                    'upload_max_thread',
+                    default=3,
+                ),
             ),
             mysql=MySQLSettings(
                 dsn=_get_value('MYSQL_DSN', mysql_config, 'dsn', default=''),
@@ -201,6 +220,14 @@ class Settings:
                 max_video_seconds=_get_int_value('MAX_VIDEO_SECONDS', inference_config, 'max_video_seconds', default=180),
                 video_frame_ext=_get_value('VIDEO_FRAME_EXT', inference_config, 'video_frame_ext', default='png'),
                 video_codec=_get_value('VIDEO_CODEC', inference_config, 'video_codec', default='libx264'),
+                video_codec_fallbacks=tuple(
+                    _get_csv_values(
+                        'VIDEO_CODEC_FALLBACKS',
+                        inference_config,
+                        'video_codec_fallbacks',
+                        default='h264_mf,mpeg4',
+                    ),
+                ),
                 video_pix_fmt=_get_value('VIDEO_PIX_FMT', inference_config, 'video_pix_fmt', default='yuv420p'),
                 audio_fallback_no_audio=_get_bool_value(
                     'AUDIO_FALLBACK_NO_AUDIO',
@@ -275,6 +302,19 @@ def _parse_bool(name: str, value: str) -> bool:
     if lowered in ('0', 'false', 'no', 'off'):
         return False
     raise ValueError(f'Invalid boolean configuration: {name}={value}')
+
+
+def _get_csv_values(env_name: str, section: Dict[str, Any], key: str, default: str = '') -> list[str]:
+    env_value = os.getenv(env_name, '').strip()
+    raw_value: Any = env_value if env_value else section.get(key, default)
+    if isinstance(raw_value, list):
+        return [str(item).strip() for item in raw_value if str(item).strip()]
+    if raw_value is None:
+        return []
+    text = str(raw_value).strip()
+    if not text:
+        return []
+    return [part.strip() for part in text.split(',') if part.strip()]
 
 
 def _load_config_file(path: str) -> Dict[str, Any]:

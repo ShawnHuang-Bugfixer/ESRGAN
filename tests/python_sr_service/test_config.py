@@ -1,4 +1,4 @@
-﻿import pytest
+import pytest
 
 from python_sr_service.config import Settings
 
@@ -9,6 +9,10 @@ def test_settings_from_env(monkeypatch):
     monkeypatch.setenv('COS_REGION', 'ap-guangzhou')
     monkeypatch.setenv('COS_BUCKET', 'bucket-12345')
     monkeypatch.setenv('COS_PREFIX', 'sr')
+    monkeypatch.setenv('COS_TIMEOUT_SECONDS', '240')
+    monkeypatch.setenv('COS_MULTIPART_THRESHOLD_MB', '16')
+    monkeypatch.setenv('COS_UPLOAD_PART_MB', '8')
+    monkeypatch.setenv('COS_UPLOAD_MAX_THREAD', '4')
     monkeypatch.setenv('MYSQL_DSN', 'mysql://root:pwd@127.0.0.1:3306/picture')
     monkeypatch.setenv('MYSQL_AUTOCOMMIT', 'false')
     monkeypatch.setenv('MQ_URL', 'amqp://guest:guest@localhost:5672/%2F')
@@ -17,6 +21,7 @@ def test_settings_from_env(monkeypatch):
     monkeypatch.setenv('VIDEO_ENABLED', 'true')
     monkeypatch.setenv('FFMPEG_BIN', 'ffmpeg')
     monkeypatch.setenv('MAX_VIDEO_FRAMES', '6000')
+    monkeypatch.setenv('VIDEO_CODEC_FALLBACKS', 'mpeg4,libxvid')
 
     settings = Settings.from_env(config_path='')
     assert settings.cos.secret_id == 'id'
@@ -24,6 +29,10 @@ def test_settings_from_env(monkeypatch):
     assert settings.cos.region == 'ap-guangzhou'
     assert settings.cos.bucket == 'bucket-12345'
     assert settings.cos.prefix == 'sr'
+    assert settings.cos.timeout_seconds == 240
+    assert settings.cos.multipart_threshold_mb == 16
+    assert settings.cos.upload_part_mb == 8
+    assert settings.cos.upload_max_thread == 4
     assert settings.mysql.dsn == 'mysql://root:pwd@127.0.0.1:3306/picture'
     assert settings.mysql.autocommit is False
     assert settings.rabbitmq.url == 'amqp://guest:guest@localhost:5672/%2F'
@@ -33,6 +42,7 @@ def test_settings_from_env(monkeypatch):
     assert settings.inference.video_enabled is True
     assert settings.inference.ffmpeg_bin == 'ffmpeg'
     assert settings.inference.max_video_frames == 6000
+    assert settings.inference.video_codec_fallbacks == ('mpeg4', 'libxvid')
 
 
 def test_settings_from_file(tmp_path, monkeypatch):
@@ -52,6 +62,10 @@ def test_settings_from_file(tmp_path, monkeypatch):
         '  region: ap-shanghai\n'
         '  bucket: file-bucket-1\n'
         '  prefix: file-prefix\n'
+        '  timeout_seconds: 300\n'
+        '  multipart_threshold_mb: 12\n'
+        '  upload_part_mb: 6\n'
+        '  upload_max_thread: 2\n'
         'mysql:\n'
         '  dsn: mysql://root:pwd@localhost:3306/picture\n'
         '  autocommit: false\n'
@@ -65,7 +79,8 @@ def test_settings_from_file(tmp_path, monkeypatch):
         '  model_name: realesr-general-x4v3\n'
         '  denoise_strength: 0.8\n'
         '  video_enabled: true\n'
-        '  max_video_seconds: 300\n',
+        '  max_video_seconds: 300\n'
+        '  video_codec_fallbacks: mpeg4,libxvid\n',
         encoding='utf-8')
 
     settings = Settings.from_env(config_path=str(config_file))
@@ -74,6 +89,10 @@ def test_settings_from_file(tmp_path, monkeypatch):
     assert settings.cos.region == 'ap-shanghai'
     assert settings.cos.bucket == 'file-bucket-1'
     assert settings.cos.prefix == 'file-prefix'
+    assert settings.cos.timeout_seconds == 300
+    assert settings.cos.multipart_threshold_mb == 12
+    assert settings.cos.upload_part_mb == 6
+    assert settings.cos.upload_max_thread == 2
     assert settings.mysql.dsn == 'mysql://root:pwd@localhost:3306/picture'
     assert settings.mysql.autocommit is False
     assert settings.rabbitmq.url == 'amqp://guest:guest@localhost:5672/%2F'
@@ -83,6 +102,7 @@ def test_settings_from_file(tmp_path, monkeypatch):
     assert settings.inference.denoise_strength == 0.8
     assert settings.inference.video_enabled is True
     assert settings.inference.max_video_seconds == 300
+    assert settings.inference.video_codec_fallbacks == ('mpeg4', 'libxvid')
 
 
 def test_env_overrides_file(tmp_path, monkeypatch):

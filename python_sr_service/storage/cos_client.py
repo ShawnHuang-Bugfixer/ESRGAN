@@ -67,8 +67,22 @@ class TencentCOSClient(ObjectStorage):
             ),
         )
         try:
-            with open(local_path, 'rb') as file_obj:
-                self._client.put_object(Bucket=self._bucket, Body=file_obj, Key=full_key)
+            file_size = os.path.getsize(local_path)
+            threshold_bytes = max(1, self._settings.multipart_threshold_mb) * 1024 * 1024
+            use_multipart = hasattr(self._client, 'upload_file') and file_size >= threshold_bytes
+
+            if use_multipart:
+                self._client.upload_file(
+                    Bucket=self._bucket,
+                    Key=full_key,
+                    LocalFilePath=local_path,
+                    PartSize=max(1, self._settings.upload_part_mb),
+                    MAXThread=max(1, self._settings.upload_max_thread),
+                )
+            else:
+                with open(local_path, 'rb') as file_obj:
+                    self._client.put_object(Bucket=self._bucket, Body=file_obj, Key=full_key)
+
             logger.info(
                 'cos_upload_done %s',
                 format_log_fields(
@@ -78,6 +92,7 @@ class TencentCOSClient(ObjectStorage):
                         'bucket': self._bucket,
                         'objectKey': full_key,
                         'localPath': local_path,
+                        'multipart': use_multipart,
                     },
                 ),
             )
@@ -135,6 +150,7 @@ class TencentCOSClient(ObjectStorage):
             'SecretId': settings.secret_id,
             'SecretKey': settings.secret_key,
             'Scheme': settings.scheme,
+            'Timeout': settings.timeout_seconds,
         }
         if settings.token:
             config_kwargs['Token'] = settings.token

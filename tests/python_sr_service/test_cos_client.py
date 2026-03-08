@@ -1,4 +1,3 @@
-
 import pytest
 
 from python_sr_service.config import COSSettings
@@ -27,6 +26,7 @@ class FakeCosClient:
         self.raise_get = None
         self.raise_put = None
         self.raise_head = None
+        self.upload_file_calls = []
 
     def get_object(self, Bucket, Key):
         if self.raise_get:
@@ -40,6 +40,22 @@ class FakeCosClient:
             raise self.raise_put
         self.storage[Key] = Body.read()
         return {'ETag': 'etag'}
+
+    def upload_file(self, Bucket, Key, LocalFilePath, PartSize=1, MAXThread=5, **kwargs):
+        if self.raise_put:
+            raise self.raise_put
+        with open(LocalFilePath, 'rb') as file_obj:
+            self.storage[Key] = file_obj.read()
+        self.upload_file_calls.append(
+            {
+                'Bucket': Bucket,
+                'Key': Key,
+                'LocalFilePath': LocalFilePath,
+                'PartSize': PartSize,
+                'MAXThread': MAXThread,
+            },
+        )
+        return {'ETag': 'etag-multipart'}
 
     def head_object(self, Bucket, Key):
         if self.raise_head:
@@ -72,6 +88,10 @@ def _settings(prefix=''):
         region='ap-guangzhou',
         bucket='bucket-1250000000',
         prefix=prefix,
+        timeout_seconds=120,
+        multipart_threshold_mb=8,
+        upload_part_mb=4,
+        upload_max_thread=2,
     )
 
 
@@ -86,6 +106,29 @@ def test_upload_download_roundtrip(tmp_path):
     output_file = tmp_path / 'output.bin'
     client.download('task/input.bin', str(output_file))
     assert output_file.read_bytes() == b'hello cos'
+
+
+def test_upload_large_file_uses_multipart(tmp_path):
+    cos_client = FakeCosClient()
+    settings = COSSettings(
+        secret_id='id',
+        secret_key='key',
+        region='ap-guangzhou',
+        bucket='bucket-1250000000',
+        multipart_threshold_mb=1,
+        upload_part_mb=2,
+        upload_max_thread=3,
+    )
+    client = TencentCOSClient(settings, client=cos_client)
+
+    source_file = tmp_path / 'big.bin'
+    source_file.write_bytes(b'x' * (2 * 1024 * 1024))
+    client.upload(str(source_file), 'task/big.bin')
+
+    assert len(cos_client.upload_file_calls) == 1
+    call = cos_client.upload_file_calls[0]
+    assert call['PartSize'] == 2
+    assert call['MAXThread'] == 3
 
 
 def test_download_missing_maps_to_input_not_found(tmp_path):
