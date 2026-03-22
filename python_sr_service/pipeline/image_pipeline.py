@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union
 
 import cv2
+import numpy as np
 import torch
 from basicsr.archs.rrdbnet_arch import RRDBNet
 
@@ -17,6 +18,9 @@ from python_sr_service.runtime.logging import format_log_fields
 
 logger = logging.getLogger(__name__)
 
+_TILE_FALLBACKS = (1024, 768, 512, 384, 256, 192, 128, 64)
+_STARTUP_PRELOAD_TILES = (0, 1024)
+
 
 @dataclass(frozen=True)
 class InferenceOutput:
@@ -28,6 +32,49 @@ class ImagePipeline:
     def __init__(self, settings: InferenceSettings):
         self._settings = settings
         self._upsamplers: Dict[str, RealESRGANer] = {}
+
+    def prepare(self, model_name_override: str = '') -> None:
+        model_name = self._resolve_model_name(model_name_override)
+        preload_tiles = _startup_preload_tiles(self._settings.tile)
+        if hasattr(torch.backends, 'cudnn'):
+            torch.backends.cudnn.benchmark = True
+
+        for tile in preload_tiles:
+            upsampler = self._ensure_upsampler(model_name_override=model_name, tile_override=tile)
+            if not _should_warmup(self._settings.device):
+                continue
+
+            warmup_image = np.zeros((16, 16, 3), dtype=np.uint8)
+            start = time.time()
+            try:
+                with torch.inference_mode():
+                    upsampler.enhance(warmup_image, outscale=4)
+            except Exception:
+                logger.exception('image_model_warmup_failed')
+                continue
+
+            logger.info(
+                'image_model_warmup_done %s',
+                format_log_fields(
+                    {
+                        'modelName': model_name,
+                        'device': self._settings.device,
+                        'tile': tile,
+                        'costMs': int((time.time() - start) * 1000),
+                    },
+                ),
+            )
+
+        logger.info(
+            'image_model_prepare_done %s',
+            format_log_fields(
+                {
+                    'modelName': model_name,
+                    'device': self._settings.device,
+                    'preloadedTiles': preload_tiles,
+                },
+            ),
+        )
 
     def run(self, input_file: str, output_file: str, scale: int, model_name_override: str = '') -> InferenceOutput:
         logger.info(
@@ -44,16 +91,29 @@ class ImagePipeline:
             ),
         )
 
+        decode_started = time.time()
         image = cv2.imread(input_file, cv2.IMREAD_UNCHANGED)
+        decode_cost_ms = int((time.time() - decode_started) * 1000)
         if image is None:
             raise ServiceError(
                 code=ErrorCode.INPUT_NOT_FOUND,
                 message=f'Failed to read input image: {input_file}',
                 retryable=False,
             )
+        logger.info(
+            'image_decode_done %s',
+            format_log_fields(
+                {
+                    'phase': 'decode',
+                    'inputFile': input_file,
+                    'costMs': decode_cost_ms,
+                },
+            ),
+        )
 
         output, cost_ms = self.enhance_array(image, scale, model_name_override=model_name_override)
 
+        write_started = time.time()
         os.makedirs(os.path.dirname(output_file) or '.', exist_ok=True)
         if not cv2.imwrite(output_file, output):
             raise ServiceError(
@@ -61,6 +121,17 @@ class ImagePipeline:
                 message=f'Failed to write output image: {output_file}',
                 retryable=False,
             )
+        write_cost_ms = int((time.time() - write_started) * 1000)
+        logger.info(
+            'image_write_done %s',
+            format_log_fields(
+                {
+                    'phase': 'encode_or_write',
+                    'outputFile': output_file,
+                    'costMs': write_cost_ms,
+                },
+            ),
+        )
 
         logger.info(
             'image_infer_done %s',
@@ -81,40 +152,78 @@ class ImagePipeline:
 
     def enhance_array(self, image, scale: int, model_name_override: str = ''):
         start = time.time()
-        upsampler = self._ensure_upsampler(model_name_override=model_name_override)
-        try:
-            output, _ = upsampler.enhance(image, outscale=scale)
-        except RuntimeError as exc:
-            text = str(exc).lower()
-            if 'out of memory' in text:
+        model_name = self._resolve_model_name(model_name_override)
+        tile_candidates = _tile_candidates(self._settings.tile, image)
+        last_oom: Optional[RuntimeError] = None
+
+        for index, tile in enumerate(tile_candidates):
+            upsampler = self._ensure_upsampler(model_name_override=model_name, tile_override=tile)
+            try:
+                with torch.inference_mode():
+                    output, _ = upsampler.enhance(image, outscale=scale)
+                cost_ms = int((time.time() - start) * 1000)
+                if tile != self._settings.tile:
+                    logger.warning(
+                        'image_infer_tiled_fallback_succeeded %s',
+                        format_log_fields(
+                            {
+                                'modelName': model_name,
+                                'tile': tile,
+                                'costMs': cost_ms,
+                            },
+                        ),
+                    )
+                return output, cost_ms
+            except RuntimeError as exc:
+                text = str(exc).lower()
+                if 'out of memory' not in text:
+                    raise ServiceError(
+                        code=ErrorCode.INFER_RUNTIME_ERROR,
+                        message='Runtime error during image inference',
+                        retryable=True,
+                        cause=exc,
+                    ) from exc
+
+                last_oom = exc
+                next_tile = tile_candidates[index + 1] if index + 1 < len(tile_candidates) else None
+                if next_tile is None:
+                    break
+                _clear_cuda_cache()
+                logger.warning(
+                    'image_infer_retry_tiled %s',
+                    format_log_fields(
+                        {
+                            'modelName': model_name,
+                            'device': self._settings.device,
+                            'attemptedTile': tile,
+                            'nextTile': next_tile,
+                            'height': int(image.shape[0]),
+                            'width': int(image.shape[1]),
+                        },
+                    ),
+                )
+            except Exception as exc:
+                logger.exception('image_infer_unexpected_error')
                 raise ServiceError(
-                    code=ErrorCode.GPU_OOM,
-                    message='GPU out of memory during inference',
-                    retryable=False,
+                    code=ErrorCode.INFER_RUNTIME_ERROR,
+                    message='Failed to run image inference',
+                    retryable=True,
                     cause=exc,
                 ) from exc
-            raise ServiceError(
-                code=ErrorCode.INFER_RUNTIME_ERROR,
-                message='Runtime error during image inference',
-                retryable=True,
-                cause=exc,
-            ) from exc
-        except Exception as exc:
-            logger.exception('image_infer_unexpected_error')
-            raise ServiceError(
-                code=ErrorCode.INFER_RUNTIME_ERROR,
-                message='Failed to run image inference',
-                retryable=True,
-                cause=exc,
-            ) from exc
 
-        cost_ms = int((time.time() - start) * 1000)
-        return output, cost_ms
+        raise ServiceError(
+            code=ErrorCode.GPU_OOM,
+            message='GPU out of memory during inference',
+            retryable=False,
+            cause=last_oom,
+        ) from last_oom
 
-    def _ensure_upsampler(self, model_name_override: str = '') -> RealESRGANer:
+    def _ensure_upsampler(self, model_name_override: str = '', tile_override: Optional[int] = None) -> RealESRGANer:
         model_name = self._resolve_model_name(model_name_override)
-        if model_name in self._upsamplers:
-            return self._upsamplers[model_name]
+        tile = self._settings.tile if tile_override is None else int(tile_override)
+        cache_key = _upsampler_cache_key(model_name, tile)
+        if cache_key in self._upsamplers:
+            return self._upsamplers[cache_key]
 
         model, net_scale = _build_model(model_name)
         model_path, dni_weight = _resolve_model_paths(self._settings, model_name_override=model_name)
@@ -132,7 +241,7 @@ class ImagePipeline:
                     'device': self._settings.device,
                     'gpuId': gpu_id,
                     'half': use_half,
-                    'tile': self._settings.tile,
+                    'tile': tile,
                     'tilePad': self._settings.tile_pad,
                 },
             ),
@@ -142,13 +251,13 @@ class ImagePipeline:
             model_path=model_path,
             dni_weight=dni_weight,
             model=model,
-            tile=self._settings.tile,
+            tile=tile,
             tile_pad=self._settings.tile_pad,
             pre_pad=self._settings.pre_pad,
             half=use_half,
             gpu_id=gpu_id,
         )
-        self._upsamplers[model_name] = upsampler
+        self._upsamplers[cache_key] = upsampler
         return upsampler
 
     def _resolve_model_name(self, model_name_override: str) -> str:
@@ -283,3 +392,63 @@ def _resolve_device(device: str, fp32: bool):
                 gpu_id = None
         return gpu_id, not fp32
     return None, False
+
+
+def _should_warmup(device: str) -> bool:
+    lower = device.strip().lower()
+    return lower.startswith('cuda') and torch.cuda.is_available()
+
+
+def _tile_candidates(configured_tile: int, image) -> list[int]:
+    max_side = max(int(image.shape[0]), int(image.shape[1]))
+    candidates: list[int] = []
+    first_tile = _initial_tile(configured_tile, image)
+    candidates.append(first_tile)
+    for tile in _TILE_FALLBACKS:
+        if tile >= max_side:
+            continue
+        if first_tile > 0 and tile >= first_tile:
+            continue
+        if tile not in candidates:
+            candidates.append(tile)
+    return candidates
+
+
+def _startup_preload_tiles(configured_tile: int) -> list[int]:
+    base_tile = max(0, int(configured_tile))
+    candidates: list[int] = [base_tile]
+    for tile in _STARTUP_PRELOAD_TILES:
+        normalized = max(0, int(tile))
+        if normalized not in candidates:
+            candidates.append(normalized)
+    return candidates
+
+
+def _initial_tile(configured_tile: int, image) -> int:
+    normalized_tile = max(0, int(configured_tile))
+    if normalized_tile > 0:
+        return normalized_tile
+
+    height = int(image.shape[0])
+    width = int(image.shape[1])
+    max_side = max(height, width)
+    pixels = height * width
+
+    if max_side <= 1200 and pixels <= 1_500_000:
+        return 0
+    if max_side <= 2000 and pixels <= 3_500_000:
+        return 1024
+    if max_side <= 3000 and pixels <= 6_500_000:
+        return 768
+    if max_side <= 4200 and pixels <= 12_000_000:
+        return 512
+    return 384
+
+
+def _upsampler_cache_key(model_name: str, tile: int) -> str:
+    return f'{model_name}:tile={max(0, int(tile))}'
+
+
+def _clear_cuda_cache() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()

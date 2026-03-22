@@ -23,6 +23,8 @@ from python_sr_service.worker.publisher import RabbitMQResultPublisher
 
 logger = logging.getLogger(__name__)
 
+LOCKED_SERVICE_MODEL_NAME = 'RealESRGAN_x4plus'
+
 
 class RabbitMQConsumer:
     # 重试分层通过延迟队列实现（TTL + 死信回流主队列）。
@@ -51,6 +53,20 @@ class RabbitMQConsumer:
         self._worker_id = settings.runtime.worker_id or f'worker-{os.getpid()}'
         self._connection: Optional[pika.BlockingConnection] = None
         self._channel = None
+
+    def prepare(self) -> None:
+        configured = self._settings.inference.model_name.strip()
+        if configured != LOCKED_SERVICE_MODEL_NAME:
+            logger.warning(
+                'service_model_forced %s',
+                format_log_fields(
+                    {
+                        'configuredModel': configured,
+                        'effectiveModel': LOCKED_SERVICE_MODEL_NAME,
+                    },
+                ),
+            )
+        self._image_pipeline.prepare(model_name_override=LOCKED_SERVICE_MODEL_NAME)
 
     def start(self) -> None:
         while True:
@@ -246,9 +262,12 @@ class RabbitMQConsumer:
                 self._task_log(task, phase='download', status='DONE', costMs=download_cost_ms),
             )
 
-            model_name = task.model_name.strip() or self._settings.inference.model_name
+            model_name = self._resolve_model_name(task)
             infer_started = time.time()
-            logger.info('task_phase_start %s', self._task_log(task, phase='enhance', taskType=task.task_type))
+            logger.info(
+                'task_phase_start %s',
+                self._task_log(task, phase='enhance', taskType=task.task_type, modelName=model_name),
+            )
 
             if task.task_type == 'image':
                 infer_result = self._image_pipeline.run(
@@ -317,6 +336,7 @@ class RabbitMQConsumer:
                     taskType=task.task_type,
                     costMs=max(infer_cost_ms, infer_result.cost_ms),
                     outputLocalPath=infer_result.output_path,
+                    modelName=model_name,
                 ),
             )
 
@@ -354,6 +374,7 @@ class RabbitMQConsumer:
                     taskType=task.task_type,
                     costMs=total_cost_ms,
                     outputFileKey=output_key,
+                    modelName=model_name,
                 ),
             )
         except ServiceError as exc:
@@ -380,6 +401,20 @@ class RabbitMQConsumer:
                         'task_workspace_cleaned %s',
                         self._task_log(task, phase='cleanup', workspace=workspace.task_root),
                     )
+
+    def _resolve_model_name(self, task: TaskMessage) -> str:
+        task_model = task.model_name.strip()
+        if task_model and task_model != LOCKED_SERVICE_MODEL_NAME:
+            logger.warning(
+                'task_model_override_ignored %s',
+                self._task_log(
+                    task,
+                    phase='schema_validate',
+                    requestedModel=task_model,
+                    effectiveModel=LOCKED_SERVICE_MODEL_NAME,
+                ),
+            )
+        return LOCKED_SERVICE_MODEL_NAME
 
     def _publish_progress(self, task: TaskMessage, progress: int) -> None:
         bounded = max(0, min(100, int(progress)))

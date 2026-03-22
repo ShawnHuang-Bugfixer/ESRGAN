@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+﻿from dataclasses import dataclass
 import os
 from pathlib import Path
 from typing import Any, Dict
@@ -70,9 +70,10 @@ class InferenceSettings:
     ffprobe_bin: str = 'ffprobe'
     max_video_frames: int = 3000
     max_video_seconds: int = 180
+    video_processing_mode: str = 'stream'
     video_frame_ext: str = 'png'
-    video_codec: str = 'libx264'
-    video_codec_fallbacks: tuple[str, ...] = ('h264_mf', 'mpeg4')
+    video_codec: str = 'h264_nvenc'
+    video_codec_fallbacks: tuple[str, ...] = ('h264_mf', 'libx264', 'mpeg4')
     video_pix_fmt: str = 'yuv420p'
     audio_fallback_no_audio: bool = True
 
@@ -218,14 +219,20 @@ class Settings:
                 ffprobe_bin=_get_value('FFPROBE_BIN', inference_config, 'ffprobe_bin', default='ffprobe'),
                 max_video_frames=_get_int_value('MAX_VIDEO_FRAMES', inference_config, 'max_video_frames', default=3000),
                 max_video_seconds=_get_int_value('MAX_VIDEO_SECONDS', inference_config, 'max_video_seconds', default=180),
+                video_processing_mode=_get_value(
+                    'VIDEO_PROCESSING_MODE',
+                    inference_config,
+                    'video_processing_mode',
+                    default='stream',
+                ),
                 video_frame_ext=_get_value('VIDEO_FRAME_EXT', inference_config, 'video_frame_ext', default='png'),
-                video_codec=_get_value('VIDEO_CODEC', inference_config, 'video_codec', default='libx264'),
+                video_codec=_get_value('VIDEO_CODEC', inference_config, 'video_codec', default='h264_nvenc'),
                 video_codec_fallbacks=tuple(
                     _get_csv_values(
                         'VIDEO_CODEC_FALLBACKS',
                         inference_config,
                         'video_codec_fallbacks',
-                        default='h264_mf,mpeg4',
+                        default='h264_mf,libx264,mpeg4',
                     ),
                 ),
                 video_pix_fmt=_get_value('VIDEO_PIX_FMT', inference_config, 'video_pix_fmt', default='yuv420p'),

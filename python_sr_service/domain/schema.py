@@ -9,7 +9,7 @@ from python_sr_service.domain.errors import ErrorCode, ServiceError
 @dataclass(frozen=True)
 class VideoOptions:
     keep_audio: bool = True
-    extract_frame_first: bool = True
+    extract_frame_first: Optional[bool] = None
     fps_override: Optional[float] = None
 
 
@@ -96,7 +96,7 @@ def _parse_video_options(raw: Any) -> VideoOptions:
         )
 
     keep_audio = raw.get('keepAudio', True)
-    extract_frame_first = raw.get('extractFrameFirst', True)
+    extract_frame_first = raw.get('extractFrameFirst')
     fps_override_raw = raw.get('fpsOverride')
 
     if not isinstance(keep_audio, bool):
@@ -106,10 +106,10 @@ def _parse_video_options(raw: Any) -> VideoOptions:
             retryable=False,
         )
 
-    if not isinstance(extract_frame_first, bool):
+    if extract_frame_first is not None and not isinstance(extract_frame_first, bool):
         raise ServiceError(
             code=ErrorCode.SCHEMA_INVALID,
-            message='videoOptions.extractFrameFirst must be boolean',
+            message='videoOptions.extractFrameFirst must be boolean when provided',
             retryable=False,
         )
 
