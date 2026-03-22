@@ -23,7 +23,7 @@ from python_sr_service.worker.publisher import RabbitMQResultPublisher
 
 logger = logging.getLogger(__name__)
 
-LOCKED_SERVICE_MODEL_NAME = 'RealESRGAN_x4plus'
+DEFAULT_IMAGE_MODEL_NAME = 'RealESRGAN_x4plus'
 
 
 class RabbitMQConsumer:
@@ -48,25 +48,27 @@ class RabbitMQConsumer:
         self._storage = storage or TencentCOSClient(settings.cos)
         self._event_repo = event_repo or MySQLEventRepository(settings.mysql)
         self._image_pipeline = image_pipeline or ImagePipeline(settings.inference)
-        self._video_pipeline = video_pipeline or VideoPipeline(settings.inference, self._image_pipeline)
+        self._video_pipeline = video_pipeline or VideoPipeline(settings.inference)
         self._workspace_manager = workspace_manager or WorkspaceManager(settings.runtime.work_dir)
         self._worker_id = settings.runtime.worker_id or f'worker-{os.getpid()}'
         self._connection: Optional[pika.BlockingConnection] = None
         self._channel = None
 
     def prepare(self) -> None:
-        configured = self._settings.inference.model_name.strip()
-        if configured != LOCKED_SERVICE_MODEL_NAME:
-            logger.warning(
-                'service_model_forced %s',
-                format_log_fields(
-                    {
-                        'configuredModel': configured,
-                        'effectiveModel': LOCKED_SERVICE_MODEL_NAME,
-                    },
-                ),
-            )
-        self._image_pipeline.prepare(model_name_override=LOCKED_SERVICE_MODEL_NAME)
+        image_model = self._settings.inference.model_name.strip() or DEFAULT_IMAGE_MODEL_NAME
+        self._image_pipeline.prepare(model_name_override=image_model)
+        self._video_pipeline.prepare()
+        logger.info(
+            'service_models_prepared %s',
+            format_log_fields(
+                {
+                    'workerId': self._worker_id,
+                    'imageModel': image_model,
+                    'videoModel': self._video_pipeline.active_model_name,
+                    'videoTile': self._settings.inference.video_tile,
+                },
+            ),
+        )
 
     def start(self) -> None:
         while True:
@@ -120,7 +122,6 @@ class RabbitMQConsumer:
             and self._connection.is_open
         ):
             return
-        # 每次连接/重连都声明拓扑，保证冷启动和断线恢复可用。
         self._reset_connection()
         self._connection = pika.BlockingConnection(pika.URLParameters(self._mq.url))
         self._channel = self._connection.channel()
@@ -293,9 +294,30 @@ class RabbitMQConsumer:
                         frame_index = int(phase_payload.get('frameIndex', 0) or 0)
                         total_frames = max(int(phase_payload.get('totalFrames', 1) or 1), 1)
                         progress = 30 + int(frame_index * 50 / total_frames)
-                        if progress >= progress_state['last_progress'] + 5 or frame_index == total_frames:
+                        should_log = frame_index % 10 == 0 or frame_index == total_frames
+                        if progress >= progress_state['last_progress'] + 10 or frame_index == total_frames:
                             progress_state['last_progress'] = progress
                             self._publish_progress(task, progress=progress)
+                            should_log = True
+                        if should_log:
+                            logger.info(
+                                'task_video_heartbeat %s',
+                                self._task_log(
+                                    task,
+                                    phase='video_stream_heartbeat',
+                                    frameIndex=frame_index,
+                                    totalFrames=total_frames,
+                                    progress=progress,
+                                    elapsedMs=phase_payload.get('elapsedMs'),
+                                    avgFps=phase_payload.get('avgFps'),
+                                    decodeQueueSize=phase_payload.get('decodeQueueSize'),
+                                    encodeQueueSize=phase_payload.get('encodeQueueSize'),
+                                    codec=phase_payload.get('codec'),
+                                    withAudio=phase_payload.get('withAudio'),
+                                    modelName=phase_payload.get('modelName'),
+                                    tile=phase_payload.get('tile'),
+                                ),
+                            )
                         return
                     if phase == 'frames_inferred':
                         self._save_event(task, 'FRAMES_INFERRED', payload_json=phase_payload)
@@ -403,18 +425,23 @@ class RabbitMQConsumer:
                     )
 
     def _resolve_model_name(self, task: TaskMessage) -> str:
+        if task.task_type == 'video':
+            effective_model = self._video_pipeline.active_model_name or DEFAULT_IMAGE_MODEL_NAME
+        else:
+            effective_model = self._settings.inference.model_name.strip() or DEFAULT_IMAGE_MODEL_NAME
+
         task_model = task.model_name.strip()
-        if task_model and task_model != LOCKED_SERVICE_MODEL_NAME:
+        if task_model and task_model != effective_model:
             logger.warning(
                 'task_model_override_ignored %s',
                 self._task_log(
                     task,
                     phase='schema_validate',
                     requestedModel=task_model,
-                    effectiveModel=LOCKED_SERVICE_MODEL_NAME,
+                    effectiveModel=effective_model,
                 ),
             )
-        return LOCKED_SERVICE_MODEL_NAME
+        return effective_model
 
     def _publish_progress(self, task: TaskMessage, progress: int) -> None:
         bounded = max(0, min(100, int(progress)))

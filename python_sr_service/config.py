@@ -1,6 +1,8 @@
 ﻿from dataclasses import dataclass
 import os
 from pathlib import Path
+import shutil
+import sys
 from typing import Any, Dict
 
 import yaml
@@ -70,10 +72,15 @@ class InferenceSettings:
     ffprobe_bin: str = 'ffprobe'
     max_video_frames: int = 3000
     max_video_seconds: int = 180
+    video_model_name: str = 'realesr-general-x4v3'
+    video_model_weights: str = ''
+    video_tile: int = 512
+    video_stream_only: bool = True
+    video_require_hw_encoder: bool = True
     video_processing_mode: str = 'stream'
     video_frame_ext: str = 'png'
     video_codec: str = 'h264_nvenc'
-    video_codec_fallbacks: tuple[str, ...] = ('h264_mf', 'libx264', 'mpeg4')
+    video_codec_fallbacks: tuple[str, ...] = ()
     video_pix_fmt: str = 'yuv420p'
     audio_fallback_no_audio: bool = True
 
@@ -215,10 +222,41 @@ class Settings:
                 pre_pad=_get_int_value('MODEL_PRE_PAD', inference_config, 'pre_pad', default=0),
                 fp32=_get_bool_value('MODEL_FP32', inference_config, 'fp32', default=False),
                 video_enabled=_get_bool_value('VIDEO_ENABLED', inference_config, 'video_enabled', default=True),
-                ffmpeg_bin=_get_value('FFMPEG_BIN', inference_config, 'ffmpeg_bin', default='ffmpeg'),
-                ffprobe_bin=_get_value('FFPROBE_BIN', inference_config, 'ffprobe_bin', default='ffprobe'),
+                ffmpeg_bin=_resolve_command_path(
+                    _get_value('FFMPEG_BIN', inference_config, 'ffmpeg_bin', default='ffmpeg'),
+                    executable_names=('ffmpeg.exe', 'ffmpeg'),
+                ),
+                ffprobe_bin=_resolve_command_path(
+                    _get_value('FFPROBE_BIN', inference_config, 'ffprobe_bin', default='ffprobe'),
+                    executable_names=('ffprobe.exe', 'ffprobe'),
+                ),
                 max_video_frames=_get_int_value('MAX_VIDEO_FRAMES', inference_config, 'max_video_frames', default=3000),
                 max_video_seconds=_get_int_value('MAX_VIDEO_SECONDS', inference_config, 'max_video_seconds', default=180),
+                video_model_name=_get_value(
+                    'VIDEO_MODEL_NAME',
+                    inference_config,
+                    'video_model_name',
+                    default='realesr-general-x4v3',
+                ),
+                video_model_weights=_get_value(
+                    'VIDEO_MODEL_WEIGHTS',
+                    inference_config,
+                    'video_model_weights',
+                    default='',
+                ),
+                video_tile=_get_int_value('VIDEO_TILE', inference_config, 'video_tile', default=512),
+                video_stream_only=_get_bool_value(
+                    'VIDEO_STREAM_ONLY',
+                    inference_config,
+                    'video_stream_only',
+                    default=True,
+                ),
+                video_require_hw_encoder=_get_bool_value(
+                    'VIDEO_REQUIRE_HW_ENCODER',
+                    inference_config,
+                    'video_require_hw_encoder',
+                    default=True,
+                ),
                 video_processing_mode=_get_value(
                     'VIDEO_PROCESSING_MODE',
                     inference_config,
@@ -232,7 +270,7 @@ class Settings:
                         'VIDEO_CODEC_FALLBACKS',
                         inference_config,
                         'video_codec_fallbacks',
-                        default='h264_mf,libx264,mpeg4',
+                        default='',
                     ),
                 ),
                 video_pix_fmt=_get_value('VIDEO_PIX_FMT', inference_config, 'video_pix_fmt', default='yuv420p'),
@@ -323,6 +361,58 @@ def _get_csv_values(env_name: str, section: Dict[str, Any], key: str, default: s
         return []
     return [part.strip() for part in text.split(',') if part.strip()]
 
+
+
+
+def _resolve_command_path(value: str, executable_names: tuple[str, ...] = ()) -> str:
+    text = str(value or '').strip()
+    if not text:
+        return ''
+
+    direct_path = Path(text)
+    if direct_path.is_file():
+        return str(direct_path.resolve())
+
+    resolved = shutil.which(text)
+    if resolved:
+        return str(Path(resolved).resolve())
+
+    conda_resolved = _resolve_conda_command_path(text, executable_names)
+    if conda_resolved:
+        return conda_resolved
+
+    return text
+
+
+def _resolve_conda_command_path(value: str, executable_names: tuple[str, ...]) -> str:
+    try:
+        python_path = Path(sys.executable).resolve()
+    except OSError:
+        return ''
+
+    env_root = python_path.parent
+    candidate_names: list[str] = []
+    for name in (Path(value).name, *executable_names):
+        text = str(name).strip()
+        if text and text not in candidate_names:
+            candidate_names.append(text)
+
+    search_dirs = [
+        env_root,
+        env_root / 'Library' / 'bin',
+        env_root / 'Scripts',
+        env_root / 'bin',
+    ]
+
+    for directory in search_dirs:
+        if not directory.exists():
+            continue
+        for candidate_name in candidate_names:
+            candidate = directory / candidate_name
+            if candidate.is_file():
+                return str(candidate.resolve())
+
+    return ''
 
 def _load_config_file(path: str) -> Dict[str, Any]:
     if not path or not os.path.exists(path):

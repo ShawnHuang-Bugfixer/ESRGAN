@@ -1,12 +1,14 @@
-﻿from functools import lru_cache
+﻿from dataclasses import dataclass, replace
+from functools import lru_cache
 import glob
 import json
 import logging
 import os
+from queue import Empty, Full, Queue
 import shutil
 import subprocess
+import threading
 import time
-from dataclasses import dataclass
 from fractions import Fraction
 from typing import Any, Callable, Dict, Optional
 
@@ -21,6 +23,10 @@ from python_sr_service.runtime.logging import format_log_fields
 
 logger = logging.getLogger(__name__)
 
+_QUEUE_EOF = object()
+_STREAM_QUEUE_SIZE = 4
+_STREAM_HEARTBEAT_FRAMES = 10
+
 
 @dataclass(frozen=True)
 class VideoInferenceOutput(InferenceOutput):
@@ -33,7 +39,39 @@ class VideoInferenceOutput(InferenceOutput):
 class VideoPipeline:
     def __init__(self, settings: InferenceSettings, image_pipeline: Optional[ImagePipeline] = None):
         self._settings = settings
-        self._image_pipeline = image_pipeline or ImagePipeline(settings)
+        self._video_settings = _build_video_inference_settings(settings)
+        self._active_video_settings = self._video_settings
+        self._image_pipeline = image_pipeline or ImagePipeline(self._active_video_settings)
+
+    def prepare(self) -> None:
+        try:
+            self._image_pipeline.prepare(model_name_override=self._video_settings.model_name)
+            self._active_video_settings = self._video_settings
+        except ServiceError as exc:
+            if exc.code != ErrorCode.MODEL_NOT_FOUND:
+                raise
+            fallback_settings = _build_video_fallback_settings(self._settings)
+            logger.warning(
+                'video_model_fallback %s',
+                format_log_fields(
+                    {
+                        'requestedModel': self._video_settings.model_name,
+                        'fallbackModel': fallback_settings.model_name,
+                        'reason': str(exc),
+                    },
+                ),
+            )
+            self._active_video_settings = fallback_settings
+            self._image_pipeline = ImagePipeline(self._active_video_settings)
+            self._image_pipeline.prepare(model_name_override=self._active_video_settings.model_name)
+
+    @property
+    def active_model_name(self) -> str:
+        return self._active_video_settings.model_name.strip()
+
+    @property
+    def active_tile(self) -> int:
+        return int(self._active_video_settings.tile)
 
     def run(
         self,
@@ -71,6 +109,7 @@ class VideoPipeline:
 
         fps = options.fps_override if options.fps_override is not None else meta['fps']
         mode = self._resolve_processing_mode(options)
+        model_name = (model_name_override or self._active_video_settings.model_name).strip()
         logger.info(
             'video_processing_mode_selected %s',
             format_log_fields(
@@ -80,6 +119,8 @@ class VideoPipeline:
                     'mode': mode,
                     'fps': fps,
                     'frameCount': meta['frame_count'],
+                    'modelName': model_name,
+                    'tile': self._active_video_settings.tile,
                 },
             ),
         )
@@ -91,7 +132,7 @@ class VideoPipeline:
                 scale,
                 fps,
                 meta,
-                model_name_override,
+                model_name,
                 options,
                 phase_callback,
             )
@@ -103,12 +144,12 @@ class VideoPipeline:
                     scale,
                     fps,
                     meta,
-                    model_name_override,
+                    model_name,
                     options,
                     phase_callback,
                 )
             except ServiceError as exc:
-                if _should_fallback_to_extract(exc):
+                if not self._settings.video_stream_only and _should_fallback_to_extract(exc):
                     logger.warning(
                         'video_stream_fallback_extract %s',
                         format_log_fields(
@@ -126,7 +167,7 @@ class VideoPipeline:
                         scale,
                         fps,
                         meta,
-                        model_name_override,
+                        model_name,
                         options,
                         phase_callback,
                     )
@@ -219,6 +260,11 @@ class VideoPipeline:
             )
 
     def _resolve_processing_mode(self, options: VideoOptions) -> str:
+        if self._settings.video_stream_only:
+            if options.extract_frame_first is True:
+                logger.warning('video_extract_request_ignored %s', format_log_fields({'forcedMode': 'stream'}))
+            return 'stream'
+
         if options.extract_frame_first is True:
             return 'extract'
         if options.extract_frame_first is False:
@@ -247,7 +293,6 @@ class VideoPipeline:
         frame_output_dir = os.path.join(os.path.dirname(output_file), '_frames_out')
         os.makedirs(frame_input_dir, exist_ok=True)
         os.makedirs(frame_output_dir, exist_ok=True)
-
         try:
             frame_pattern = os.path.join(frame_input_dir, f'frame%08d.{frame_ext}')
             self._extract_frames(input_file, frame_pattern)
@@ -386,15 +431,46 @@ class VideoPipeline:
         frame_size = width * height * 3
         expected_frames = max(int(meta['frame_count']), 0)
         _emit(phase_callback, 'frames_extracted', {'frameCount': expected_frames, 'frameExt': 'rawvideo', 'mode': 'stream'})
+        logger.info(
+            'video_stream_start %s',
+            format_log_fields(
+                {
+                    'inputFile': input_file,
+                    'outputFile': output_file,
+                    'width': width,
+                    'height': height,
+                    'outWidth': out_width,
+                    'outHeight': out_height,
+                    'fps': fps,
+                    'frameCount': expected_frames,
+                    'modelName': model_name_override,
+                    'tile': self._active_video_settings.tile,
+                    'withAudio': with_audio,
+                },
+            ),
+        )
 
-        configured_codecs = _codec_candidates(self._settings.video_codec, self._settings.video_codec_fallbacks)
-        codecs = _filter_available_codecs(self._settings.ffmpeg_bin, configured_codecs)
+        codecs = _resolve_video_codecs(self._settings, self._settings.ffmpeg_bin)
         last_error: Optional[ServiceError] = None
 
         for codec in codecs:
             decoder = None
             writer = None
-            processed_frames = 0
+            decode_queue: Queue[Any] = Queue(maxsize=_STREAM_QUEUE_SIZE)
+            encode_queue: Queue[Any] = Queue(maxsize=_STREAM_QUEUE_SIZE)
+            stop_event = threading.Event()
+            errors: list[ServiceError] = []
+            processed_frames = {'value': 0}
+            decoded_frames = {'value': 0}
+            inferred_frames = {'value': 0}
+            failed_stage = {'value': ''}
+
+            def record_error(stage: str, exc: ServiceError) -> None:
+                failed_stage['value'] = stage
+                if not errors:
+                    errors.append(exc)
+                stop_event.set()
+
             try:
                 decoder = subprocess.Popen(
                     _decoder_command(self._settings.ffmpeg_bin, input_file),
@@ -424,46 +500,157 @@ class VideoPipeline:
                         retryable=True,
                     )
 
-                while True:
-                    frame_bytes = _read_exact(decoder.stdout, frame_size)
-                    if not frame_bytes:
-                        break
-                    if len(frame_bytes) != frame_size:
-                        raise ServiceError(
-                            code=ErrorCode.FFMPEG_ERROR,
-                            message='Unexpected EOF while reading decoded video frames',
-                            retryable=True,
-                        )
-
-                    image = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((height, width, 3))
-                    output, _ = self._image_pipeline.enhance_array(image, scale, model_name_override=model_name_override)
+                def decode_worker() -> None:
+                    frame_index = 0
+                    logger.info('video_decode_worker_start %s', format_log_fields({'codec': codec, 'inputFile': input_file}))
                     try:
-                        writer.stdin.write(np.ascontiguousarray(output).tobytes())
-                    except (BrokenPipeError, OSError) as exc:
-                        stderr = _drain_pipe(writer.stderr)
-                        raise ServiceError(
-                            code=ErrorCode.FFMPEG_ERROR,
-                            message=stderr or str(exc),
-                            retryable=True,
-                            cause=exc,
-                        ) from exc
+                        while not stop_event.is_set():
+                            frame_bytes = _read_exact(decoder.stdout, frame_size)
+                            if not frame_bytes:
+                                break
+                            if len(frame_bytes) != frame_size:
+                                raise ServiceError(
+                                    code=ErrorCode.FFMPEG_ERROR,
+                                    message='Unexpected EOF while reading decoded video frames',
+                                    retryable=True,
+                                )
+                            frame_index += 1
+                            decoded_frames['value'] = frame_index
+                            image = np.frombuffer(frame_bytes, dtype=np.uint8).reshape((height, width, 3)).copy()
+                            _queue_put(decode_queue, (frame_index, image), stop_event)
+                    except ServiceError as exc:
+                        record_error('decode', exc)
+                    except Exception as exc:
+                        record_error(
+                            'decode',
+                            ServiceError(
+                                code=ErrorCode.FFMPEG_ERROR,
+                                message=str(exc),
+                                retryable=True,
+                                cause=exc,
+                            ),
+                        )
+                    finally:
+                        logger.info(
+                            'video_decode_worker_done %s',
+                            format_log_fields({'codec': codec, 'decodedFrames': decoded_frames['value'], 'stopped': stop_event.is_set()}),
+                        )
+                        _queue_put(decode_queue, _QUEUE_EOF, stop_event)
 
-                    processed_frames += 1
-                    _emit(phase_callback, 'frame_enhanced', {'frameIndex': processed_frames, 'totalFrames': max(expected_frames, processed_frames)})
+                def infer_worker() -> None:
+                    logger.info('video_infer_worker_start %s', format_log_fields({'modelName': model_name_override, 'tile': self._active_video_settings.tile}))
+                    try:
+                        while not stop_event.is_set():
+                            item = _queue_get(decode_queue, stop_event)
+                            if item is _QUEUE_EOF:
+                                break
+                            frame_index, image = item
+                            output, _ = self._image_pipeline.enhance_array(
+                                image,
+                                scale,
+                                model_name_override=model_name_override,
+                            )
+                            inferred_frames['value'] = frame_index
+                            _queue_put(encode_queue, (frame_index, np.ascontiguousarray(output)), stop_event)
+                    except ServiceError as exc:
+                        record_error('infer', exc)
+                    except Exception as exc:
+                        record_error(
+                            'infer',
+                            ServiceError(
+                                code=ErrorCode.INFER_RUNTIME_ERROR,
+                                message='Failed to run video frame inference',
+                                retryable=True,
+                                cause=exc,
+                            ),
+                        )
+                    finally:
+                        logger.info(
+                            'video_infer_worker_done %s',
+                            format_log_fields({'modelName': model_name_override, 'inferredFrames': inferred_frames['value'], 'stopped': stop_event.is_set()}),
+                        )
+                        _queue_put(encode_queue, _QUEUE_EOF, stop_event)
 
-                if processed_frames <= 0:
-                    raise ServiceError(
-                        code=ErrorCode.INPUT_INVALID,
-                        message='No frames decoded from input video',
-                        retryable=False,
-                    )
+                def encode_worker() -> None:
+                    logger.info('video_encode_worker_start %s', format_log_fields({'codec': codec, 'outputFile': output_file, 'withAudio': with_audio}))
+                    try:
+                        while not stop_event.is_set():
+                            item = _queue_get(encode_queue, stop_event)
+                            if item is _QUEUE_EOF:
+                                break
+                            frame_index, output = item
+                            try:
+                                writer.stdin.write(output.tobytes())
+                            except (BrokenPipeError, OSError) as exc:
+                                stderr = _drain_pipe(writer.stderr)
+                                raise ServiceError(
+                                    code=ErrorCode.FFMPEG_ERROR,
+                                    message=stderr or str(exc),
+                                    retryable=True,
+                                    cause=exc,
+                                ) from exc
+                            processed_frames['value'] = frame_index
+                            elapsed_ms = max(int((time.time() - started) * 1000), 1)
+                            avg_fps = round(frame_index * 1000 / elapsed_ms, 2)
+                            _emit(
+                                phase_callback,
+                                'frame_enhanced',
+                                {
+                                    'frameIndex': frame_index,
+                                    'totalFrames': max(expected_frames, frame_index),
+                                    'elapsedMs': elapsed_ms,
+                                    'avgFps': avg_fps,
+                                    'decodeQueueSize': decode_queue.qsize(),
+                                    'encodeQueueSize': encode_queue.qsize(),
+                                    'codec': codec,
+                                    'withAudio': with_audio,
+                                    'modelName': model_name_override,
+                                    'tile': self._active_video_settings.tile,
+                                },
+                            )
+                    except ServiceError as exc:
+                        record_error('encode', exc)
+                    except Exception as exc:
+                        record_error(
+                            'encode',
+                            ServiceError(
+                                code=ErrorCode.FFMPEG_ERROR,
+                                message=str(exc),
+                                retryable=True,
+                                cause=exc,
+                            ),
+                        )
+                    finally:
+                        logger.info(
+                            'video_encode_worker_done %s',
+                            format_log_fields({'codec': codec, 'encodedFrames': processed_frames['value'], 'stopped': stop_event.is_set()}),
+                        )
+                        _close_stdin(writer)
 
-                _close_stdin(writer)
+                threads = [
+                    threading.Thread(target=decode_worker, name='video-decode', daemon=True),
+                    threading.Thread(target=infer_worker, name='video-infer', daemon=True),
+                    threading.Thread(target=encode_worker, name='video-encode', daemon=True),
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+
+                if errors:
+                    raise errors[0]
+
                 decoder_stderr = _drain_pipe(decoder.stderr)
                 writer_stderr = _drain_pipe(writer.stderr)
                 decoder_rc = decoder.wait()
                 writer_rc = writer.wait()
 
+                if processed_frames['value'] <= 0:
+                    raise ServiceError(
+                        code=ErrorCode.INPUT_INVALID,
+                        message='No frames decoded from input video',
+                        retryable=False,
+                    )
                 if decoder_rc != 0:
                     raise ServiceError(
                         code=ErrorCode.FFMPEG_ERROR,
@@ -477,8 +664,24 @@ class VideoPipeline:
                         retryable=True,
                     )
 
-                _emit(phase_callback, 'frames_inferred', {'frameCount': processed_frames, 'mode': 'stream'})
+                total_cost_ms = int((time.time() - started) * 1000)
+                avg_fps = round(processed_frames['value'] * 1000 / max(total_cost_ms, 1), 2)
+                _emit(phase_callback, 'frames_inferred', {'frameCount': processed_frames['value'], 'mode': 'stream'})
                 _emit(phase_callback, 'video_merged', {'usedAudio': with_audio, 'fps': fps, 'merged': True, 'mode': 'stream'})
+                logger.info(
+                    'video_stream_done %s',
+                    format_log_fields(
+                        {
+                            'codec': codec,
+                            'frameCount': processed_frames['value'],
+                            'costMs': total_cost_ms,
+                            'avgFps': avg_fps,
+                            'withAudio': with_audio,
+                            'modelName': model_name_override,
+                            'tile': self._active_video_settings.tile,
+                        },
+                    ),
+                )
                 if codec != self._settings.video_codec:
                     logger.warning(
                         'video_codec_fallback_used %s',
@@ -487,19 +690,34 @@ class VideoPipeline:
 
                 return VideoInferenceOutput(
                     output_path=output_file,
-                    cost_ms=int((time.time() - started) * 1000),
-                    frame_count=processed_frames,
+                    cost_ms=total_cost_ms,
+                    frame_count=processed_frames['value'],
                     fps=fps,
                     had_audio=meta['has_audio'],
                     used_audio=with_audio,
                 )
             except ServiceError as exc:
                 last_error = exc
+                logger.error(
+                    'video_stream_failed %s',
+                    format_log_fields(
+                        {
+                            'codec': codec,
+                            'failedStage': failed_stage['value'] or 'stream',
+                            'processedFrames': processed_frames['value'],
+                            'decodedFrames': decoded_frames['value'],
+                            'inferredFrames': inferred_frames['value'],
+                            'errorCode': exc.code.value,
+                            'errorMsg': str(exc),
+                        },
+                    ),
+                )
                 if _is_unknown_encoder_error(str(exc)):
                     logger.warning('video_codec_unavailable %s', format_log_fields({'codec': codec}))
                     continue
                 raise
             finally:
+                stop_event.set()
                 _terminate_process(decoder)
                 _terminate_process(writer)
 
@@ -524,8 +742,7 @@ class VideoPipeline:
         _run_command(cmd, ErrorCode.FFMPEG_ERROR)
 
     def _merge_video(self, frame_pattern: str, input_file: str, output_file: str, fps: float, with_audio: bool) -> None:
-        configured_codecs = _codec_candidates(self._settings.video_codec, self._settings.video_codec_fallbacks)
-        codecs = _filter_available_codecs(self._settings.ffmpeg_bin, configured_codecs)
+        codecs = _resolve_video_codecs(self._settings, self._settings.ffmpeg_bin)
         last_error: Optional[ServiceError] = None
 
         for codec in codecs:
@@ -577,6 +794,56 @@ class VideoPipeline:
 
         if last_error is not None:
             raise last_error
+
+
+def _build_video_inference_settings(settings: InferenceSettings) -> InferenceSettings:
+    video_model_name = settings.video_model_name.strip() or settings.model_name.strip()
+    return replace(
+        settings,
+        model_name=video_model_name,
+        model_weights=settings.video_model_weights.strip(),
+        tile=max(0, int(settings.video_tile)),
+    )
+
+
+def _build_video_fallback_settings(settings: InferenceSettings) -> InferenceSettings:
+    fallback_model_name = settings.model_name.strip()
+    return replace(
+        settings,
+        model_name=fallback_model_name,
+        model_weights=settings.model_weights.strip(),
+        tile=max(0, int(settings.video_tile)),
+    )
+
+
+def available_video_encoders(ffmpeg_bin: str) -> list[str]:
+    return sorted(_available_encoders(ffmpeg_bin))
+
+
+def resolve_video_codec_chain(settings: InferenceSettings) -> list[str]:
+    return _resolve_video_codecs(settings, settings.ffmpeg_bin)
+
+
+def _resolve_video_codecs(settings: InferenceSettings, ffmpeg_bin: str) -> list[str]:
+    configured_codecs = _codec_candidates(settings.video_codec, settings.video_codec_fallbacks)
+    available = _available_encoders(ffmpeg_bin)
+    codecs = [codec for codec in configured_codecs if codec in available] if available else configured_codecs
+    if settings.video_require_hw_encoder:
+        primary = settings.video_codec.strip()
+        if primary not in codecs:
+            raise ServiceError(
+                code=ErrorCode.FFMPEG_ERROR,
+                message=f'Required hardware video encoder unavailable: {primary}',
+                retryable=False,
+            )
+        return [primary]
+    if available and not codecs:
+        raise ServiceError(
+            code=ErrorCode.FFMPEG_ERROR,
+            message=f'No usable configured video encoder is available: {configured_codecs}',
+            retryable=False,
+        )
+    return codecs
 
 
 def _run_command(command: list[str], error_code: ErrorCode) -> str:
@@ -762,7 +1029,10 @@ def _drain_pipe(stream) -> str:
     if stream is None:
         return ''
     try:
-        return stream.read().decode('utf-8', errors='replace').strip()
+        data = stream.read()
+        if isinstance(data, bytes):
+            return data.decode('utf-8', errors='replace').strip()
+        return str(data).strip()
     except Exception:
         return ''
 
@@ -803,6 +1073,27 @@ def _terminate_process(process: Optional[subprocess.Popen]) -> None:
             process.wait(timeout=1)
         except Exception:
             pass
+
+
+def _queue_put(queue_obj: Queue[Any], item: Any, stop_event: Optional[threading.Event]) -> None:
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            return
+        try:
+            queue_obj.put(item, timeout=0.1)
+            return
+        except Full:
+            continue
+
+
+def _queue_get(queue_obj: Queue[Any], stop_event: threading.Event) -> Any:
+    while True:
+        if stop_event.is_set() and queue_obj.empty():
+            return _QUEUE_EOF
+        try:
+            return queue_obj.get(timeout=0.1)
+        except Empty:
+            continue
 
 
 def _should_fallback_to_extract(error: ServiceError) -> bool:

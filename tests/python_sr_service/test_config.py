@@ -1,3 +1,6 @@
+from pathlib import Path
+
+import python_sr_service.config as config_module
 import pytest
 
 from python_sr_service.config import Settings
@@ -40,7 +43,7 @@ def test_settings_from_env(monkeypatch):
     assert settings.inference.model_weights == ''
     assert settings.inference.denoise_strength == 0.6
     assert settings.inference.video_enabled is True
-    assert settings.inference.ffmpeg_bin == 'ffmpeg'
+    assert Path(settings.inference.ffmpeg_bin).name.lower() in {'ffmpeg', 'ffmpeg.exe'}
     assert settings.inference.max_video_frames == 6000
     assert settings.inference.video_codec_fallbacks == ('mpeg4', 'libxvid')
 
@@ -143,3 +146,31 @@ def test_settings_missing_required_env(monkeypatch):
     monkeypatch.delenv('REDIS_URL', raising=False)
     with pytest.raises(ValueError):
         Settings.from_env(config_path='__missing__.yml')
+
+
+def test_settings_resolve_ffmpeg_bins_from_conda_env(tmp_path, monkeypatch):
+    env_root = tmp_path / 'env'
+    library_bin = env_root / 'Library' / 'bin'
+    library_bin.mkdir(parents=True)
+    python_exe = env_root / 'python.exe'
+    python_exe.write_text('', encoding='utf-8')
+    ffmpeg = library_bin / 'ffmpeg.exe'
+    ffprobe = library_bin / 'ffprobe.exe'
+    ffmpeg.write_text('', encoding='utf-8')
+    ffprobe.write_text('', encoding='utf-8')
+
+    monkeypatch.setenv('COS_SECRET_ID', 'id')
+    monkeypatch.setenv('COS_SECRET_KEY', 'key')
+    monkeypatch.setenv('COS_REGION', 'ap-guangzhou')
+    monkeypatch.setenv('COS_BUCKET', 'bucket-12345')
+    monkeypatch.setenv('MQ_URL', 'amqp://guest:guest@localhost:5672/%2F')
+    monkeypatch.setenv('REDIS_URL', 'redis://localhost:6379/0')
+    monkeypatch.setenv('FFMPEG_BIN', 'ffmpeg')
+    monkeypatch.setenv('FFPROBE_BIN', 'ffprobe')
+    monkeypatch.setattr(config_module.shutil, 'which', lambda _: None)
+    monkeypatch.setattr(config_module.sys, 'executable', str(python_exe))
+
+    settings = Settings.from_env(config_path='')
+
+    assert settings.inference.ffmpeg_bin == str(ffmpeg.resolve())
+    assert settings.inference.ffprobe_bin == str(ffprobe.resolve())
